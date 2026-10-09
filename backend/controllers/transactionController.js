@@ -28,8 +28,11 @@ exports.remove = asyncHandler(async (req, res) => {
 });
 
 exports.receipt = asyncHandler(async (req, res) => {
-  const filePath = await service.getReceiptPath(req.user._id, req.params.id);
-  res.sendFile(filePath);
+  const access = await service.getReceiptAccess(req.user._id, req.params.id);
+  if (access.type === "redirect") {
+    return res.redirect(access.url);
+  }
+  res.sendFile(access.path);
 });
 
 exports.exportCsv = asyncHandler(async (req, res) => {

@@ -1,16 +1,11 @@
-const path = require("path");
 const multer = require("multer");
 const AppError = require("../utils/AppError");
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, path.join(__dirname, "..", "uploads", "receipts"));
-  },
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    cb(null, `${req.user._id}-${Date.now()}${ext}`);
-  },
-});
+// Receipts are uploaded to Cloudinary (see services/transactionService.js),
+// not written to local disk - memoryStorage hands the file bytes to the
+// route handler as req.file.buffer instead of saving them to this server's
+// (ephemeral, on Render) filesystem.
+const storage = multer.memoryStorage();
 
 const fileFilter = (req, file, cb) => {
   const allowed = [

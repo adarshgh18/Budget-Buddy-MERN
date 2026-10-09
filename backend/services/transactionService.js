@@ -1,9 +1,11 @@
+const fs = require("fs");
 const path = require("path");
 const Transaction = require("../models/Transaction");
 const Category = require("../models/Category");
 const AppError = require("../utils/AppError");
 const { startOfYear, endOfYear } = require("../utils/date");
 const { generateDueRecurring } = require("./recurringService");
+const { cloudinary, RECEIPT_FOLDER } = require("../config/cloudinary");
 
 const resolveCategory = async (userId, name, type) => {
   const category = await Category.findOne({
@@ -14,9 +16,38 @@ const resolveCategory = async (userId, name, type) => {
   return category;
 };
 
-const applyReceipt = (req, payload) => {
+// Uploads a receipt buffer (multer memoryStorage - see middleware/upload.js)
+// to Cloudinary under Budget-Buddy/receipts. Uses the "authenticated"
+// delivery type rather than the default public "upload" type: an
+// authenticated asset cannot be fetched from Cloudinary by URL alone, only
+// via a signed URL, which this app only ever generates after its own
+// auth + ownership check passes (see getReceiptAccess below). This preserves
+// the existing "receipts are not publicly accessible" security property
+// instead of just relocating the files to a different public host.
+const uploadReceiptBuffer = (buffer) =>
+  new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        folder: RECEIPT_FOLDER,
+        resource_type: "image", // Cloudinary serves JPG/PNG/WEBP and PDF alike under "image"
+        type: "authenticated",
+        unique_filename: true,
+        overwrite: false,
+      },
+      (err, result) => (err ? reject(err) : resolve(result))
+    );
+    stream.end(buffer);
+  });
+
+const applyReceipt = async (req, payload) => {
   if (req.file) {
-    payload.receiptUrl = `/uploads/receipts/${req.file.filename}`;
+    const result = await uploadReceiptBuffer(req.file.buffer);
+    payload.receiptPublicId = result.public_id;
+    payload.receiptFormat = result.format;
+    // Not used for actual retrieval (that always goes through the signed,
+    // ownership-checked /receipt endpoint) - kept populated for visibility/
+    // debugging, same field earlier local uploads used for their path.
+    payload.receiptUrl = result.secure_url;
     payload.receiptOriginalName = req.file.originalname;
   }
   return payload;
@@ -110,20 +141,56 @@ exports.getById = async (userId, id) => {
   return tx;
 };
 
-exports.getReceiptPath = async (userId, id) => {
+// Returns how the controller should serve this transaction's receipt:
+//   { type: "redirect", url }  - new Cloudinary-backed receipts (the normal case
+//                                 going forward)
+//   { type: "file", path }    - legacy receipts uploaded before this migration,
+//                                 still stored under backend/uploads/receipts
+// Ownership is verified here, before either URL/path is produced, exactly as
+// the previous local-disk-only implementation did.
+exports.getReceiptAccess = async (userId, id) => {
   const tx = await Transaction.findOne({ _id: id, owner: userId });
   if (!tx) throw new AppError(404, "Transaction not found.");
-  if (!tx.receiptUrl) throw new AppError(404, "This transaction has no receipt attached.");
-  // receiptUrl is always server-generated (see applyReceipt) as "/uploads/receipts/<filename>",
-  // but we defensively take only the basename before joining it to the receipts directory so
-  // this can never be tricked into reading a file outside that folder.
+  if (!tx.receiptPublicId && !tx.receiptUrl) {
+    throw new AppError(404, "This transaction has no receipt attached.");
+  }
+
+  if (tx.receiptPublicId) {
+    // NOTE: plain cloudinary.url({ type: "authenticated", sign_url: true, expires_at })
+    // does NOT actually expire - expires_at is silently ignored there; it only produces
+    // a deterministic, non-expiring path signature. private_download_url is Cloudinary's
+    // real mechanism for a genuinely time-limited signed URL (enforced server-side).
+    const url = cloudinary.utils.private_download_url(tx.receiptPublicId, tx.receiptFormat || undefined, {
+      resource_type: "image",
+      type: "authenticated",
+      attachment: false, // inline viewing (matches the existing "open in a new tab" behavior, not a forced download)
+      // Freshly generated on every request, so a 5-minute window is plenty
+      // for the browser tab this is opened in to actually load the file.
+      expires_at: Math.floor(Date.now() / 1000) + 300,
+    });
+    return { type: "redirect", url };
+  }
+
+  // Legacy path: receiptUrl is a server-generated "/uploads/receipts/<filename>"
+  // from before this migration. We defensively take only the basename before
+  // joining it to the receipts directory so this can never be tricked into
+  // reading a file outside that folder. That folder is NOT persisted on
+  // Render (ephemeral filesystem), so this only succeeds where the original
+  // local file still happens to exist (e.g. local dev).
   const filename = path.basename(tx.receiptUrl);
-  return path.join(__dirname, "..", "uploads", "receipts", filename);
+  const filePath = path.join(__dirname, "..", "uploads", "receipts", filename);
+  if (!fs.existsSync(filePath)) {
+    throw new AppError(
+      404,
+      "This receipt was uploaded before Cloudinary storage was enabled and is no longer available."
+    );
+  }
+  return { type: "file", path: filePath };
 };
 
 exports.create = async (userId, body, req) => {
   const cat = await resolveCategory(userId, body.category, body.type);
-  const payload = applyReceipt(req, {
+  const payload = await applyReceipt(req, {
     ...body,
     owner: userId,
     categoryId: cat?._id,
@@ -139,7 +206,7 @@ exports.update = async (userId, id, body, req) => {
   const nextCategory = body.category || tx.category;
   const cat = await resolveCategory(userId, nextCategory, nextType);
 
-  Object.assign(tx, applyReceipt(req, { ...body, categoryId: cat?._id }));
+  Object.assign(tx, await applyReceipt(req, { ...body, categoryId: cat?._id }));
   await tx.save();
   return tx;
 };

@@ -18,6 +18,16 @@ const transactionSchema = new mongoose.Schema(
     description: { type: String, trim: true, default: "", maxlength: 250 },
     receiptUrl: { type: String, default: "" },
     receiptOriginalName: { type: String, default: "" },
+    // Cloudinary public_id for receipts uploaded after the Cloudinary migration.
+    // Used to generate a fresh signed delivery URL on each authenticated,
+    // ownership-checked /receipt request (see transactionService.getReceiptAccess).
+    // Empty for transactions whose receipt predates this migration - those fall
+    // back to the legacy local-path handling in receiptUrl.
+    receiptPublicId: { type: String, default: "" },
+    // Cloudinary's public_id excludes the file extension; the format (e.g.
+    // "jpg", "pdf") returned by the upload is needed to reconstruct a
+    // correct signed delivery URL later.
+    receiptFormat: { type: String, default: "" },
     recurringId: { type: mongoose.Schema.Types.ObjectId, ref: "RecurringTransaction" },
   },
   { timestamps: true }
